@@ -13,6 +13,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY src/ ./src/
 
+# 设置默认环境变量值
+ENV ZAI_SIGNING_SECRET=junjie
+
 EXPOSE 8080
 
 CMD ["python", "main.py"]
