@@ -1,10 +1,10 @@
 services:
   zai-api:
-    # # 使用本地构建
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
-    image: julienol/zai-api:latest
+    # 使用本地构建
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zai-api:local
     container_name: zai-api
     restart: unless-stopped
     ports:
