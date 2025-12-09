@@ -6,6 +6,7 @@ import sys
 import time
 import logging
 import structlog
+from structlog import contextvars as struct_context
 from contextlib import contextmanager
 from functools import wraps
 from typing import Callable, Any, Optional
@@ -16,7 +17,7 @@ from .config import settings
 def configure_structlog():
     """配置structlog日志系统"""
     processors = [
-        structlog.contextvars.merge_contextvars,
+        struct_context.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=False),
         structlog.processors.StackInfoRenderer(),
@@ -51,6 +52,21 @@ configure_structlog()
 
 # 获取全局logger实例
 _logger = structlog.get_logger()
+
+
+def bind_request_context(**kwargs) -> None:
+    """绑定结构化日志上下文，忽略空值。"""
+    filtered = {k: v for k, v in kwargs.items() if v is not None}
+    if filtered:
+        struct_context.bind_contextvars(**filtered)
+
+
+def reset_request_context(*keys: str) -> None:
+    """清理指定上下文字段，未传入则清空全部。"""
+    if keys:
+        struct_context.unbind_contextvars(*keys)
+    else:
+        struct_context.clear_contextvars()
 
 
 def error_log(message: str, *args, **kwargs) -> None:
@@ -110,6 +126,19 @@ def debug_log(message: str, *args, **kwargs) -> None:
         
         # 使用structlog记录调试日志
         _logger.debug(formatted_message, **kwargs)
+
+
+def request_stage_log(stage: str, message: str, **kwargs) -> None:
+    """
+    Log info-level request stage transitions without dumping payload data.
+
+    Args:
+        stage: Logical stage identifier (e.g. "received", "upstream_request").
+        message: Human readable description for terminal viewers.
+        **kwargs: Extra structured fields to enrich the log.
+    """
+    normalized_stage = (stage or "unknown").strip().lower().replace(" ", "_")
+    info_log(f"[REQUEST] {message}", stage=normalized_stage, **kwargs)
 
 
 def get_logger(name: str = None):

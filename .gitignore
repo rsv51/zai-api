@@ -51,11 +51,13 @@ htmlcov/
 test.*
 
 # Project specific
-tokens.txt
-proxys.txt
+tokens*.txt
+proxys*.txt
 .claude
 *.bak
 *.tmp
 .cursor/
 密钥分析.md
 debug/
+
+*.json

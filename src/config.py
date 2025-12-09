@@ -3,16 +3,24 @@ FastAPI application configuration module
 """
 
 import os
+import logging
 from pathlib import Path
+from functools import lru_cache
+from typing import Optional, Any
+
 from dotenv import load_dotenv
-from typing import Optional
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 # 加载.env文件,覆盖电脑自身环境变量，哪怕为空也要加载
 load_dotenv(override=True)
 
 
-def _load_proxy_list() -> list:
+logger = logging.getLogger("config")
+
+
+@lru_cache(maxsize=1)
+def _load_proxy_list() -> list[str]:
     """
     从环境变量和proxys.txt文件加载代理列表，并去重合并
 
@@ -43,22 +51,27 @@ def _load_proxy_list() -> list:
                 file_proxies = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
                 proxy_set.update(file_proxies)
                 if file_proxies:
-                    print(f"[INFO] 从proxys.txt加载了 {len(file_proxies)} 个代理")
+                    logger.info("[PROXY] 从proxys.txt加载代理", count=len(file_proxies))
         except Exception as e:
-            print(f"[ERROR] 读取proxys.txt失败: {e}")
+            logger.error("[PROXY] 读取proxys.txt失败", error=str(e))
 
     # 去重后的代理列表
     proxy_list = list(proxy_set)
 
     if proxy_list:
-        print(f"[INFO] 代理池初始化完成，共 {len(proxy_list)} 个唯一代理")
+        logger.info("[PROXY] 代理池初始化完成", count=len(proxy_list))
         # for i, proxy in enumerate(proxy_list, 1):
         #     print(f"  代理 {i}: {proxy}")
 
     return proxy_list
 
 
-def _load_upstream_list() -> list:
+def _get_proxy_list() -> list[str]:
+    return list(_load_proxy_list())
+
+
+@lru_cache(maxsize=1)
+def _load_upstream_list() -> list[str]:
     """
     从环境变量和upstreams.txt文件加载上游地址列表,并去重合并
 
@@ -82,19 +95,23 @@ def _load_upstream_list() -> list:
                 file_upstreams = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
                 upstream_set.update(file_upstreams)
                 if file_upstreams:
-                    print(f"[INFO] 从upstreams.txt加载了 {len(file_upstreams)} 个上游地址")
+                    logger.info("[UPSTREAM] 从upstreams.txt加载上游", count=len(file_upstreams))
         except Exception as e:
-            print(f"[ERROR] 读取upstreams.txt失败: {e}")
+            logger.error("[UPSTREAM] 读取upstreams.txt失败", error=str(e))
 
     # 去重后的上游地址列表
     upstream_list = list(upstream_set)
 
     if upstream_list:
-        print(f"[INFO] 上游地址池初始化完成,共 {len(upstream_list)} 个唯一地址")
+        logger.info("[UPSTREAM] 上游地址池初始化完成", count=len(upstream_list))
         # for i, upstream in enumerate(upstream_list, 1):
         #     print(f"  上游 {i}: {upstream}")
 
     return upstream_list
+
+
+def _get_upstream_list() -> list[str]:
+    return list(_load_upstream_list())
 
 
 class Settings(BaseSettings):
@@ -102,13 +119,11 @@ class Settings(BaseSettings):
 
     # API Configuration - 上游地址配置(支持多个地址)
     # 从环境变量和upstreams.txt文件加载上游地址列表,并去重合并
-    _upstream_list = _load_upstream_list()
-
-    # 统一的上游地址列表(合并去重后的结果)
-    UPSTREAM_LIST: list = _upstream_list
+    # 使用懒加载避免在导入时立即触发文件IO
+    UPSTREAM_LIST: list[str] = Field(default_factory=_get_upstream_list)
 
     # 为了向后兼容,保留单地址配置(使用列表中的第一个)
-    API_ENDPOINT: str = _upstream_list[0] if _upstream_list else "https://chat.z.ai/api/chat/completions"
+    API_ENDPOINT: str = Field(default_factory=lambda: (_get_upstream_list() or ["https://chat.z.ai/api/v2/chat/completions"])[0])
 
     # 上游地址策略: failover(失败切换) 或 round-robin(轮询)
     UPSTREAM_STRATEGY: str = os.getenv("UPSTREAM_STRATEGY", "round-robin").lower()
@@ -117,8 +132,11 @@ class Settings(BaseSettings):
     
     # Z.AI Token Configuration
     ZAI_TOKEN: str = os.getenv("ZAI_TOKEN", "")
-    ZAI_SIGNING_SECRET: str = os.getenv("ZAI_SIGNING_SECRET", "junjie")
-    ZAI_FE_VERSION: str = os.getenv("ZAI_FE_VERSION", "prod-fe-1.0.103")
+    ZAI_SIGNING_SECRET: str = os.getenv("ZAI_SIGNING_SECRET")
+    
+    # Z.AI FE Version - 自动获取（如果失败则使用环境变量）
+    _env_fe_version: Optional[str] = os.getenv("ZAI_FE_VERSION", "prod-fe-1.0.108")
+    ZAI_FE_VERSION: str = ""  # 稍后在模块级别初始化为自动获取的版本
     
     # Anonymous Token Configuration - 匿名Token配置
     ENABLE_GUEST_TOKEN: bool = os.getenv("ENABLE_GUEST_TOKEN", "true").lower() == "true"
@@ -135,6 +153,7 @@ class Settings(BaseSettings):
     GLM_46_THINKING_MODEL: str = os.getenv("GLM_46_THINKING_MODEL", "GLM-4.6-Thinking")
     GLM_46_SEARCH_MODEL: str = os.getenv("GLM_46_SEARCH_MODEL", "GLM-4.6-Search")
     GLM_46_ADVANCED_SEARCH_MODEL: str = os.getenv("GLM_46_ADVANCED_SEARCH_MODEL", "GLM-4.6-advanced-search")
+    GLM_46V_MODEL: str = os.getenv("GLM_46V_MODEL", "GLM-4.6V")
     
     # Server Configuration
     LISTEN_PORT: int = int(os.getenv("LISTEN_PORT", "8080"))
@@ -154,18 +173,21 @@ class Settings(BaseSettings):
     
     # Proxy Configuration - 代理配置（支持多个代理）
     # 从环境变量和proxys.txt文件加载代理列表，并去重合并
-    _proxy_list = _load_proxy_list()
-    
-    # 统一的代理列表（合并去重后的结果）
-    PROXY_LIST: list = _proxy_list
-    
+    PROXY_LIST: list[str] = Field(default_factory=_get_proxy_list)
+
     # 为了向后兼容，保留原有的配置方式
-    HTTP_PROXY_LIST: list = _proxy_list
-    HTTPS_PROXY_LIST: list = _proxy_list
-    
+    HTTP_PROXY_LIST: list[str] = Field(default_factory=_get_proxy_list)
+    HTTPS_PROXY_LIST: list[str] = Field(default_factory=_get_proxy_list)
+
     # 保留单代理配置的兼容性
-    HTTP_PROXY: Optional[str] = _proxy_list[0] if _proxy_list else None
-    HTTPS_PROXY: Optional[str] = _proxy_list[0] if _proxy_list else None
+    HTTP_PROXY: Optional[str] = None
+    HTTPS_PROXY: Optional[str] = None
+
+    def model_post_init(self, __context: Any) -> None:
+        proxy_list = self.PROXY_LIST or []
+        proxy = proxy_list[0] if proxy_list else None
+        object.__setattr__(self, "HTTP_PROXY", proxy)
+        object.__setattr__(self, "HTTPS_PROXY", proxy)
     
     # 代理策略：failover（失败切换）或 round-robin（轮询）
     PROXY_STRATEGY: str = os.getenv("PROXY_STRATEGY", "failover").lower()
@@ -178,7 +200,33 @@ class Settings(BaseSettings):
     #     env_file = ".env"
 
 
-settings = Settings()
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
+
+
+def _init_fe_version():
+    """初始化 FE_VERSION（自动获取，失败时使用环境变量）"""
+    try:
+        from .fe_version import get_fe_version_with_fallback
+        version = get_fe_version_with_fallback(fallback=settings._env_fe_version)
+        if version:
+            settings.ZAI_FE_VERSION = version
+            logger.info("[FE_VERSION] 初始化成功", version=version)
+        else:
+            logger.warning("[FE_VERSION] 无法自动获取，请检查配置")
+    except Exception as e:
+        # 如果导入失败，使用环境变量
+        if settings._env_fe_version:
+            settings.ZAI_FE_VERSION = settings._env_fe_version
+            logger.info("[FE_VERSION] 使用环境变量", version=settings._env_fe_version)
+        else:
+            logger.error("[FE_VERSION] 初始化失败", error=str(e))
+
+_init_fe_version()
 
 # Model Mapping Configuration - ZAI API模型映射
 MODEL_MAPPING = {
@@ -191,5 +239,6 @@ MODEL_MAPPING = {
     settings.GLM_46_THINKING_MODEL: "GLM-4-6-API-V1",
     settings.GLM_46_SEARCH_MODEL: "GLM-4-6-API-V1",
     settings.GLM_46_ADVANCED_SEARCH_MODEL: "GLM-4-6-API-V1",
+    settings.GLM_46V_MODEL: "glm-4.6v",
 }
 

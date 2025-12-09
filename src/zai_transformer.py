@@ -360,7 +360,7 @@ class ZAITransformer:
         
         Args:
             messages: 原始消息列表
-            is_vision_model: 是否是视觉模型（GLM-4.5V），视觉模型保留图片在messages中
+            is_vision_model: 是否是视觉模型（GLM-4.5V/GLM-4.6V），视觉模型保留图片在messages中
             
         Returns:
             (处理后的消息列表, 图片URL列表)
@@ -478,7 +478,8 @@ class ZAITransformer:
         is_search = (requested_model == settings.SEARCH_MODEL or
                     requested_model == settings.GLM_46_SEARCH_MODEL)
         is_advanced_search = (requested_model == settings.GLM_46_ADVANCED_SEARCH_MODEL)
-        is_vision_model = (requested_model == settings.GLM_45V_MODEL)
+        is_vision_model = (requested_model == settings.GLM_45V_MODEL or
+                          requested_model == settings.GLM_46V_MODEL)
 
         # 获取上游模型ID
         upstream_model_id = self.model_mapping.get(requested_model, "0727-360B-API")
@@ -491,6 +492,10 @@ class ZAITransformer:
 
         # 构建MCP服务器列表
         mcp_servers = []
+        # GLM-4.6V 添加 VLM 专有服务器（支持图片搜索、识别、处理）
+        if requested_model == settings.GLM_46V_MODEL:
+            mcp_servers.extend(["vlm-image-search", "vlm-image-recognition", "vlm-image-processing"])
+            debug_log(f"🔍 检测到 GLM-4.6V 模型，添加 VLM MCP 服务器")
         if is_advanced_search:
             mcp_servers.append("advanced-search")
             debug_log(f"🔍 检测到高级搜索模型，添加 advanced-search MCP 服务器")
@@ -505,10 +510,10 @@ class ZAITransformer:
             {"type": "mcp", "server": "image-search", "status": "hidden"},
             {"type": "mcp", "server": "deep-research", "status": "hidden"}
         ]
-        
+
         # 处理图像上传
         files_list = []
-        uploaded_files_map = {}  # 用于GLM-4.5V：原始URL -> 文件信息的映射
+        uploaded_files_map = {}  # 用于视觉模型(GLM-4.5V/GLM-4.6V)：原始URL -> 文件信息的映射
         
         if image_urls and client:
             info_log(f"检测到 {len(image_urls)} 张图像，开始上传")
@@ -531,8 +536,11 @@ class ZAITransformer:
             info_log(f"检测到 {len(image_urls)} 张图像，但未提供HTTP客户端，跳过上传")
         
         # GLM-4.5V特殊处理：修改messages中的图片URL格式
+        # 生成当前用户消息ID（用于关联files）
+        current_user_message_id = generate_uuid() if is_vision_model else None
+        
         if is_vision_model and uploaded_files_map:
-            info_log(f"[GLM-4.5V] 开始修改消息中的图片URL格式")
+            info_log(f"[Vision] 开始修改消息中的图片URL格式")
             for msg in messages:
                 if msg.get("role") == "user" and isinstance(msg.get("content"), list):
                     for part in msg["content"]:
@@ -543,35 +551,56 @@ class ZAITransformer:
                                 # 提取file信息
                                 file_data = file_info.get("file", {})
                                 file_id = file_data.get("id", "")
-                                filename = file_data.get("filename", "image.png")
-                                # 构造GLM-4.5V格式的URL: {file_id}_{filename}
-                                new_url = f"{file_id}_{filename}"
-                                part["image_url"]["url"] = new_url
+                                # GLM-4.5V格式的URL只需要file_id
+                                part["image_url"]["url"] = file_id
                                 debug_log(f"[GLM-4.5V] 图片URL已转换", 
                                          original=original_url[:50], 
-                                         new=new_url)
+                                         new=file_id)
+                                
+                                # 添加ref_user_msg_id到文件信息（用于files数组）
+                                file_info["ref_user_msg_id"] = current_user_message_id
+                                files_list.append(file_info)
             
         # 构建上游请求体
         chat_id = generate_uuid()
+
+        # GLM-4.5V 对 features/background_tasks 的要求与常规模型略有不同，
+        # 尽量对齐实际抓包格式，避免上游返回 "Oops" 错误。
+        if is_vision_model:
+            features = {
+                "image_generation": False,
+                "web_search": False,
+                "auto_web_search": False,
+                "preview_mode": True,
+                "flags": [],
+                "enable_thinking": True,
+            }
+            background_tasks = {
+                "title_generation": True,
+                "tags_generation": True,
+            }
+        else:
+            features = {
+                "image_generation": False,
+                "web_search": is_search or is_advanced_search,
+                "auto_web_search": is_search or is_advanced_search,
+                "preview_mode": True,
+                "flags": [],
+                "features": hidden_mcp_features,
+                "enable_thinking": is_thinking or is_search or is_advanced_search,
+            }
+            background_tasks = {
+                "title_generation": False,
+                "tags_generation": False,
+            }
 
         body = {
             "stream": True,
             "model": upstream_model_id,
             "messages": messages,
             "params": {},
-            "features": {
-                "image_generation": False,
-                "web_search": is_search or is_advanced_search,
-                "auto_web_search": is_search or is_advanced_search,
-                "preview_mode": is_search or is_advanced_search,
-                "flags": [],
-                "features": hidden_mcp_features,
-                "enable_thinking": is_thinking or is_search or is_advanced_search,
-            },
-            "background_tasks": {
-                "title_generation": False,
-                "tags_generation": False,
-            },
+            "features": features,
+            "background_tasks": background_tasks,
             "mcp_servers": mcp_servers,
             "variables": {
                 "{{USER_NAME}}": "Guest",
@@ -579,21 +608,30 @@ class ZAITransformer:
                 # 使用优化后的时间变量生成函数（一次调用，避免重复）
                 **generate_time_variables("Asia/Shanghai"),
             },
-            "model_item": {
-                "id": upstream_model_id,
-                "name": requested_model,
-                "owned_by": "openai"
-            },
             "chat_id": chat_id,
             "id": generate_uuid(),
         }
+
+        # 与抓包保持一致：GLM-4.5V 需要 current_user_message_id/parent_id，且不上送 model_item
+        if is_vision_model:
+            body["current_user_message_id"] = current_user_message_id
+            body["current_user_message_parent_id"] = None
+        else:
+            body["model_item"] = {
+                "id": upstream_model_id,
+                "name": requested_model,
+                "owned_by": "openai"
+            }
         
-        # 如果有上传的文件，添加到body中（GLM-4.5V除外，它的图片已在messages中）
-        if files_list and not is_vision_model:
+        # 如果有上传的文件，添加到body中
+        if files_list:
             body["files"] = files_list
             debug_log(f"添加 {len(files_list)} 个文件到请求body")
-        elif is_vision_model and uploaded_files_map:
-            debug_log(f"[GLM-4.5V] 图片已保留在messages中，不添加files字段")
+        
+        # GLM-4.5V需要添加current_user_message_id字段
+        if is_vision_model and current_user_message_id:
+            body["current_user_message_id"] = current_user_message_id
+            debug_log(f"[GLM-4.5V] 添加current_user_message_id: {current_user_message_id}")
 
         # 生成时间戳和请求ID
         timestamp = int(time.time() * 1000)
