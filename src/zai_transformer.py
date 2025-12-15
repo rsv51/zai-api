@@ -474,6 +474,8 @@ class ZAITransformer:
         requested_model = request.get("model", settings.PRIMARY_MODEL)
         is_thinking = (requested_model == settings.THINKING_MODEL or
                       requested_model == settings.GLM_46_THINKING_MODEL or
+                      requested_model == settings.GLM_45V_MODEL or  # glm4.5v 视觉模型也是 thinking 模型
+                      requested_model == settings.GLM_46V_MODEL or  # glm4.6v 视觉模型也是 thinking 模型
                       request.get("reasoning", False))
         is_search = (requested_model == settings.SEARCH_MODEL or
                     requested_model == settings.GLM_46_SEARCH_MODEL)
@@ -701,5 +703,7 @@ class ZAITransformer:
         return {
             "body": body,
             "config": config,
-            "token": token
+            "token": token,
+            "is_thinking": is_thinking,  # 标记是否为thinking模型，响应处理时用于判断是否输出reasoning_content
+            "is_vision_model": is_vision_model,  # 标记是否为V系列视觉模型（4.5v/4.6v），用于区分多阶段思考格式
         }

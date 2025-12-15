@@ -17,6 +17,7 @@ from ..helpers import (
     bind_request_context,
     reset_request_context,
     request_stage_log,
+    v_series_debug_log,
 )
 from ..schemas import OpenAIRequest
 from ..config import settings
@@ -191,6 +192,9 @@ class ChatCompletionService:
                     answer_content = ""    # 累积 answer 阶段的 delta_content（兜底）
                     latest_full_edit = ""  # 记录最后一个包含 </details> 的 edit_content（完整思考+正文）
                     latest_usage = None
+                    
+                    # 检查是否为thinking模型，非thinking模型不返回 reasoning_content
+                    is_thinking_model = transformed.get("is_thinking", False)
 
                     async for line in response.aiter_lines():
                         if not line:
@@ -249,22 +253,47 @@ class ChatCompletionService:
                                     thinking_content += edit_content
                             continue
 
-                        # thinking 阶段：累积 delta_content（只用于兜底，优先用 answer/other 阶段的完整 edit_content）
+                        # thinking 阶段：清洗后累积 delta_content
                         if phase == "thinking":
                             if delta_content:
-                                thinking_content += delta_content
+                                cleaned = self._clean_thinking(delta_content)
+                                if cleaned:
+                                    thinking_content += cleaned
                             continue
 
-                        # answer 阶段：处理 edit_content（包含完整 thinking+正文）和 delta_content
+
+                        # answer 阶段：处理 edit_content 和 delta_content
+                        # 关键区分：
+                        # - 带 edit_index + edit_content：思考内容的完整版（替换之前的增量）
+                        # - 不带 edit_index + delta_content：实际正文内容
                         if phase == "answer":
-                            # 如果有 edit_content 且包含完整的 </details>，优先用它来解析完整推理+回答
-                            if edit_content and "</details>" in edit_content:
-                                latest_full_edit = edit_content
+                            has_edit_index = data.get("edit_index") is not None
                             
-                            # 累积 answer 的 delta_content
-                            if delta_content:
+                            # 带 edit_index 的 edit_content 是思考内容的完整版
+                            if has_edit_index and edit_content:
+                                # 先提取图片 URL（如有）
+                                image_urls = self._extract_image_urls(edit_content)
+                                if image_urls:
+                                    markdown_images = self._format_images_as_markdown(image_urls)
+                                    if markdown_images:
+                                        answer_content += "\n\n" + markdown_images + "\n\n"
+                                
+                                # 记录完整思考内容（用于后续处理）
+                                if "</details>" in edit_content:
+                                    latest_full_edit = edit_content
+                                else:
+                                    # 清洗并累积思考内容
+                                    cleaned = self._clean_thinking(edit_content)
+                                    if cleaned:
+                                        new_thinking = self._diff_new_content(thinking_content, cleaned)
+                                        if new_thinking:
+                                            thinking_content += new_thinking
+                            
+                            # 不带 edit_index 的 delta_content 是正文内容
+                            elif delta_content:
                                 answer_content += delta_content
                             continue
+
 
                         # other 阶段：可能有 usage 信息，也可能有最后的 edit_content 片段
                         # 如果带有 edit_index，说明是工具调用相关内容，应放入 thinking
@@ -357,12 +386,18 @@ class ChatCompletionService:
                     )
 
                     # 构建消息对象
+                    # 对于非thinking模型，将thinking内容合并到正文，不返回 reasoning_content
+                    if not is_thinking_model and thinking_content:
+                        # 非thinking模型：将thinking内容作为前缀添加到answer_content
+                        answer_content = thinking_content + ("\n\n" if answer_content else "") + answer_content
+                        thinking_content = ""  # 清空，不作为reasoning_content返回
+                    
                     message = {
                         "role": "assistant",
                         "content": answer_content,
                     }
-                    # 如果有 thinking 内容，添加 reasoning_content 字段
-                    if thinking_content:
+                    # 只有thinking模型才添加 reasoning_content 字段
+                    if thinking_content and is_thinking_model:
                         message["reasoning_content"] = thinking_content
 
                     return {
@@ -512,6 +547,24 @@ class ChatCompletionService:
                     # 累积已输出的 reasoning/content，用于做增量 diff，避免覆盖式 delta 导致截断
                     thinking_accumulator = ""
                     answer_accumulator = ""
+                    
+                    # 累积 usage 信息，用于最终的 finish chunk
+                    latest_usage = None
+                    
+                    # 检查是否为thinking模型，非thinking模型不输出 reasoning_content
+                    is_thinking_model = transformed.get("is_thinking", False)
+                    # 检查是否为 V 系列视觉模型（4.5v/4.6v），用于区分多阶段思考格式
+                    is_vision_model = transformed.get("is_vision_model", False)
+
+                    # V系列输出响应日志辅助函数
+                    def _log_v_output(output_type: str, content: str):
+                        """记录V系列模型输出给客户端的内容（写入文件，仅debug模式）"""
+                        if is_vision_model and content:
+                            v_series_debug_log(
+                                "V系列输出响应",
+                                output_type=output_type,
+                                content=content,  # 保留完整内容
+                            )
 
                     async for line in response.aiter_lines():
                         if not line or not line.strip():
@@ -567,6 +620,17 @@ class ChatCompletionService:
                         is_done = phase == "done" or data.get("done")
                         error_info = data.get("error")
 
+                        # V系列模型上游响应调试日志（写入文件）
+                        if is_vision_model:
+                            v_series_debug_log(
+                                "V系列上游响应",
+                                phase=phase,
+                                delta_content=delta_content,  # 保留完整内容
+                                edit_content=edit_content,    # 保留完整内容
+                                has_edit_index=data.get("edit_index") is not None,
+                                edit_index=data.get("edit_index"),
+                            )
+
                         # 检测上游返回的错误（如内容安全警告）
                         if error_info:
                             error_detail = error_info.get("detail") or error_info.get("content") or "Unknown error"
@@ -603,69 +667,154 @@ class ChatCompletionService:
                                     if markdown_images:
                                         yield self._build_content_chunk(json_lib, transformed, request, "\n\n" + markdown_images + "\n\n")
                                         answer_accumulator += markdown_images
+                                
+                                # 检测是否包含 <glm_block> 标签
+                                # 如果包含，需要拆分：glm_block 前的内容是正文，glm_block 本身是工具调用
+                                if "<glm_block" in edit_content:
+                                    import re
+                                    # 拆分 glm_block 前的内容（正文）和 glm_block 本身
+                                    glm_block_match = re.search(r'<glm_block[^>]*>.*?</glm_block>', edit_content, re.DOTALL)
+                                    if glm_block_match:
+                                        # glm_block 前的内容是正文
+                                        before_glm_block = edit_content[:glm_block_match.start()].strip()
+                                        if before_glm_block:
+                                            new_answer = self._diff_new_content(answer_accumulator, before_glm_block)
+                                            if new_answer:
+                                                _log_v_output("tool_call_content", new_answer)
+                                                yield self._build_content_chunk(json_lib, transformed, request, new_answer)
+                                                answer_accumulator += new_answer
+                                        # glm_block 本身不输出（工具调用细节）
                                 else:
-                                    # 无图片，计算新增的思考内容
-                                    new_thinking = self._diff_new_content(thinking_accumulator, edit_content)
-                                    if new_thinking:
-                                        cleaned = self._clean_thinking(new_thinking)
-                                        if cleaned:
-                                            yield self._build_reasoning_chunk(json_lib, transformed, request, cleaned)
-                                            thinking_accumulator += new_thinking
+                                    # 没有 glm_block，整个内容是正文的追加
+                                    cleaned = self._clean_thinking(edit_content)
+                                    if cleaned:
+                                        new_answer = self._diff_new_content(answer_accumulator, cleaned)
+                                        if new_answer:
+                                            _log_v_output("tool_call_plain_content", new_answer)
+                                            yield self._build_content_chunk(json_lib, transformed, request, new_answer)
+                                            answer_accumulator += new_answer
                             continue
 
-                        # thinking 阶段：流式输出 reasoning_content（使用增量 diff，防止覆盖式 delta 截断）
+
+                        # thinking 阶段处理
                         if phase == "thinking":
                             if delta_content:
                                 if not has_thinking:
                                     has_thinking = True
                                     yield self._build_role_chunk(json_lib, transformed, request)
                                 
-                                # 先做“原样增量”：直接把本次 delta 里的新增部分先输出
-                                raw_new = self._diff_new_content(thinking_accumulator, delta_content)
-                                if raw_new:
-                                    cleaned_raw = self._clean_thinking(raw_new)
-                                    if cleaned_raw:
-                                        yield self._build_reasoning_chunk(
-                                            json_lib,
-                                            transformed,
-                                            request,
-                                            cleaned_raw,
-                                        )
-                                        thinking_accumulator += raw_new
+                                if not is_thinking_model:
+                                    cleaned = self._clean_thinking(delta_content)
+                                    if cleaned:
+                                        _log_v_output("thinking_content", cleaned)
+                                        yield self._build_content_chunk(json_lib, transformed, request, cleaned)
+                                        answer_accumulator += cleaned
 
-                                # 再做一次基于清洗后的兜底增量，防止上游覆盖式 delta 导致遗漏
-                                cleaned_full = self._clean_thinking(delta_content)
-                                if cleaned_full:
-                                    new_reasoning = self._diff_new_content(
-                                        self._clean_thinking(thinking_accumulator),
-                                        cleaned_full,
-                                    )
-                                    if new_reasoning:
-                                        yield self._build_reasoning_chunk(
-                                            json_lib,
-                                            transformed,
-                                            request,
-                                            new_reasoning,
+                                else:
+                                    # thinking模型：流式输出 reasoning_content（使用增量 diff，防止覆盖式 delta 截断）
+                                    # 先做"原样增量"：直接把本次 delta 里的新增部分先输出
+                                    raw_new = self._diff_new_content(thinking_accumulator, delta_content)
+                                    if raw_new:
+                                        cleaned_raw = self._clean_thinking(raw_new)
+                                        if cleaned_raw:
+                                            _log_v_output("reasoning_content", cleaned_raw)
+                                            yield self._build_reasoning_chunk(
+                                                json_lib,
+                                                transformed,
+                                                request,
+                                                cleaned_raw,
+                                            )
+                                            thinking_accumulator += raw_new
+
+                                    # 再做一次基于清洗后的兜底增量，防止上游覆盖式 delta 导致遗漏
+                                    cleaned_full = self._clean_thinking(delta_content)
+                                    if cleaned_full:
+                                        new_reasoning = self._diff_new_content(
+                                            self._clean_thinking(thinking_accumulator),
+                                            cleaned_full,
                                         )
-                                        # 这里不再修改 thinking_accumulator，避免与原始增量状态不一致
+                                        if new_reasoning:
+                                            _log_v_output("reasoning_content_fallback", new_reasoning)
+                                            yield self._build_reasoning_chunk(
+                                                json_lib,
+                                                transformed,
+                                                request,
+                                                new_reasoning,
+                                            )
+                                            # 这里不再修改 thinking_accumulator，避免与原始增量状态不一致
                             continue
 
-                        # answer 阶段：处理 edit_content（包含完整thinking）和 delta_content
+                        # answer 阶段：处理 edit_content 和 delta_content
+                        # 关键区分：
+                        # - 带 edit_index + edit_content：思考内容的完整版（替换之前的增量），应放入 reasoning_content
+                        # - 不带 edit_index + delta_content：实际正文内容，应放入 content
                         if phase == "answer":
-                            # 如果有 edit_content 且包含完整 thinking，忽略（因为已在 thinking 阶段输出）
-                            if edit_content and "</details>" in edit_content:
-                                # edit_content 包含完整的 thinking，但我们已经通过 delta 输出了
-                                pass
+                            has_edit_index = data.get("edit_index") is not None
                             
-                            # 流式输出 answer 的 delta_content
+                            # 带 edit_index 的 edit_content 可能包含 思考+正文 混合内容（V 系列模型）
+                            # 或者只是正文的追加内容（thinking 系列模型）
+                            # 通过检测 </details> 标签来区分
+                            if has_edit_index and edit_content:
+                                if not has_thinking:
+                                    has_thinking = True
+                                    yield self._build_role_chunk(json_lib, transformed, request)
+                                
+                                # 先提取图片 URL（如有）
+                                image_urls = self._extract_image_urls(edit_content)
+                                if image_urls:
+                                    markdown_images = self._format_images_as_markdown(image_urls)
+                                    if markdown_images:
+                                        yield self._build_content_chunk(json_lib, transformed, request, "\n\n" + markdown_images + "\n\n")
+                                        answer_accumulator += markdown_images
+                                
+                                # 只有包含 </details> 标签时才拆分思考和正文（V 系列模型的多阶段思考）
+                                if "</details>" in edit_content:
+                                    thinking_part, answer_part = self._split_edit_content(edit_content)
+                                    
+                                    # 处理思考部分
+                                    if thinking_part:
+                                        new_thinking = self._diff_new_content(thinking_accumulator, thinking_part)
+                                        if new_thinking:
+                                            if not is_thinking_model:
+                                                _log_v_output("answer_thinking_content", new_thinking)
+                                                yield self._build_content_chunk(json_lib, transformed, request, new_thinking)
+                                                answer_accumulator += new_thinking
+                                            else:
+                                                _log_v_output("answer_reasoning_content", new_thinking)
+                                                yield self._build_reasoning_chunk(json_lib, transformed, request, new_thinking)
+                                            thinking_accumulator += new_thinking
+                                    
+                                    # 处理正文部分
+                                    if answer_part:
+                                        new_answer = self._diff_new_content(answer_accumulator, answer_part)
+                                        if new_answer:
+                                            _log_v_output("answer_content", new_answer)
+                                            yield self._build_content_chunk(json_lib, transformed, request, new_answer)
+                                            answer_accumulator += new_answer
+                                else:
+                                    # 没有 details 标签，整个内容当作正文处理（thinking 系列模型）
+                                    cleaned = self._clean_thinking(edit_content)  # 清理可能的其他标签
+                                    if cleaned:
+                                        new_answer = self._diff_new_content(answer_accumulator, cleaned)
+                                        if new_answer:
+                                            _log_v_output("answer_plain_content", new_answer)
+                                            yield self._build_content_chunk(json_lib, transformed, request, new_answer)
+                                            answer_accumulator += new_answer
+                                continue
+
+
+                            
+                            # 不带 edit_index 的 delta_content 是正文内容
                             if delta_content:
                                 if not has_thinking:
                                     has_thinking = True
                                     yield self._build_role_chunk(json_lib, transformed, request)
                                 
+                                _log_v_output("delta_content", delta_content)
                                 yield self._build_content_chunk(json_lib, transformed, request, delta_content)
                                 answer_accumulator += delta_content
                             continue
+
 
                         # Toolify 工具检测（如果启用）
                         if enable_toolify and toolify_detector and delta_content:
@@ -686,9 +835,9 @@ class ChatCompletionService:
                         # other 阶段：可能有 usage 信息，也可能携带正文的最后一小段（edit_content 或 delta_content）
                         # 如果带有 edit_index，说明是工具调用相关内容，应放入思考
                         if phase == "other":
-                            # 1) 先处理 usage
+                            # 1) 先累积 usage 信息（稍后在 finish chunk 之后输出）
                             if data.get("usage"):
-                                yield self._build_usage_chunk(json_lib, transformed, request, data["usage"])
+                                latest_usage = data["usage"]
 
                             # 2) 判断是否是工具调用相关内容（带 edit_index）
                             has_edit_index = data.get("edit_index") is not None
@@ -715,33 +864,46 @@ class ChatCompletionService:
                                             yield self._build_content_chunk(json_lib, transformed, request, "\n\n" + markdown_images + "\n\n")
                                             answer_accumulator += markdown_images
                                     else:
-                                        # 无图片，放入 reasoning_content（思考）
-                                        new_thinking = self._diff_new_content(thinking_accumulator, tail_text)
-                                        if new_thinking:
-                                            cleaned = self._clean_thinking(new_thinking)
-                                            if cleaned:
-                                                yield self._build_reasoning_chunk(json_lib, transformed, request, cleaned)
-                                                thinking_accumulator += new_thinking
+                                        # 无图片的内容处理
+                                        # phase="other" + has_edit_index 的内容是正文末尾的补充（如最后几个字）
+                                        # 不论是 V 系列还是 thinking 系列，都应输出到正文 content
+                                        # 注意：不使用 diff 计算，因为这些是纯增量内容，直接输出即可
+                                        cleaned = self._clean_thinking(tail_text)
+                                        if cleaned:
+                                            _log_v_output("other_tail_content", cleaned)
+                                            yield self._build_content_chunk(json_lib, transformed, request, cleaned)
+                                            answer_accumulator += cleaned
+
+
                                 else:
                                     # 普通内容放入 content（正文）
+                                    _log_v_output("other_content", tail_text)
                                     yield self._build_content_chunk(json_lib, transformed, request, tail_text)
                             continue
 
-                        # 输出 usage 信息
+                        # 累积 usage 信息（用于最终输出）
                         if data.get("usage"):
-                            yield self._build_usage_chunk(json_lib, transformed, request, data["usage"])
+                            latest_usage = data["usage"]
 
                         # 检查是否为 done 状态
                         if is_done:
-                            finish_chunk = self._build_finish_chunk(json_lib, transformed, request)
+                            # 1. 发送带 usage 的 finish chunk
+                            finish_chunk = self._build_finish_chunk(json_lib, transformed, request, usage=latest_usage)
                             yield finish_chunk
+                            # 2. 如果有 usage 信息，发送独立的 usage chunk
+                            if latest_usage:
+                                yield self._build_usage_chunk(json_lib, transformed, request, latest_usage)
+                            # 3. 发送 [DONE]
                             yield "data: [DONE]\n\n"
                             await self._mark_token_success(transformed)
                             request_stage_log("stream_completed", "流式响应完成", has_error=False)
                             return
 
-                    finish_chunk = self._build_finish_chunk(json_lib, transformed, request)
+                    # 流正常结束，发送 finish chunk 和 usage chunk
+                    finish_chunk = self._build_finish_chunk(json_lib, transformed, request, usage=latest_usage)
                     yield finish_chunk
+                    if latest_usage:
+                        yield self._build_usage_chunk(json_lib, transformed, request, latest_usage)
                     yield "data: [DONE]\n\n"
 
                     await self._mark_token_success(transformed)
@@ -895,18 +1057,24 @@ class ChatCompletionService:
             token_pool.mark_token_success(current_token)
 
     def _build_role_chunk(self, json_lib, transformed: dict, request: OpenAIRequest) -> str:
+        """构建角色初始化 chunk（第一个 SSE 块）"""
         return f"data: {json_lib.dumps({
-            'choices': [{
-                'delta': {'role': 'assistant'},
-                'finish_reason': None,
-                'index': 0,
-                'logprobs': None,
-            }],
-            'created': int(time.time()),
-            'id': transformed['body']['chat_id'],
-            'model': request.model,
+            'id': 'chatcmpl-' + transformed['body']['chat_id'],
             'object': 'chat.completion.chunk',
-            'system_fingerprint': 'fp_zai_001',
+            'created': int(time.time()),
+            'model': request.model,
+            'choices': [{
+                'index': 0,
+                'delta': {
+                    'role': 'assistant',
+                    'content': '',
+                    'reasoning_content': None,
+                    'tool_calls': None,
+                },
+                'logprobs': None,
+                'finish_reason': None,
+            }],
+            'usage': None,
         })}\n\n"
 
     def _build_content_chunk(
@@ -916,18 +1084,24 @@ class ChatCompletionService:
         request: OpenAIRequest,
         content: str,
     ) -> str:
+        """构建正文内容 chunk"""
         return f"data: {json_lib.dumps({
-            'choices': [{
-                'delta': {'content': content},
-                'finish_reason': None,
-                'index': 0,
-                'logprobs': None,
-            }],
-            'created': int(time.time()),
-            'id': transformed['body']['chat_id'],
-            'model': request.model,
+            'id': 'chatcmpl-' + transformed['body']['chat_id'],
             'object': 'chat.completion.chunk',
-            'system_fingerprint': 'fp_zai_001',
+            'created': int(time.time()),
+            'model': request.model,
+            'choices': [{
+                'index': 0,
+                'delta': {
+                    'role': 'assistant',
+                    'content': content,
+                    'reasoning_content': None,
+                    'tool_calls': None,
+                },
+                'logprobs': None,
+                'finish_reason': None,
+            }],
+            'usage': None,
         })}\n\n"
 
     def _build_reasoning_chunk(
@@ -937,50 +1111,81 @@ class ChatCompletionService:
         request: OpenAIRequest,
         reasoning_content: str,
     ) -> str:
-        """构建包含 reasoning_content 的流式响应块"""
+        """构建包含 reasoning_content 的流式响应块（思考/推理内容）"""
         return f"data: {json_lib.dumps({
-            'choices': [{
-                'delta': {'reasoning_content': reasoning_content},
-                'finish_reason': None,
-                'index': 0,
-                'logprobs': None,
-            }],
-            'created': int(time.time()),
-            'id': transformed['body']['chat_id'],
-            'model': request.model,
+            'id': 'chatcmpl-' + transformed['body']['chat_id'],
             'object': 'chat.completion.chunk',
-            'system_fingerprint': 'fp_zai_001',
+            'created': int(time.time()),
+            'model': request.model,
+            'choices': [{
+                'index': 0,
+                'delta': {
+                    'role': 'assistant',
+                    'content': None,
+                    'reasoning_content': reasoning_content,
+                    'tool_calls': None,
+                },
+                'logprobs': None,
+                'finish_reason': None,
+            }],
+            'usage': None,
         })}\n\n"
 
     def _build_usage_chunk(self, json_lib, transformed: dict, request: OpenAIRequest, usage) -> str:
+        """构建 usage 信息 chunk（携带 token 使用统计）"""
+        # 规范化 usage 结构，确保包含所有必需字段
+        normalized_usage = {
+            'prompt_tokens': usage.get('prompt_tokens', 0),
+            'completion_tokens': usage.get('completion_tokens', 0),
+            'total_tokens': usage.get('total_tokens', 0),
+            'prompt_tokens_details': usage.get('prompt_tokens_details', {}),
+            'completion_tokens_details': usage.get('completion_tokens_details', {
+                'reasoning_tokens': 0,
+                'accepted_prediction_tokens': 0,
+                'rejected_prediction_tokens': 0,
+            }),
+        }
         return f"data: {json_lib.dumps({
-            'choices': [{
-                'delta': {},
-                'finish_reason': None,
-                'index': 0,
-                'logprobs': None,
-            }],
-            'created': int(time.time()),
-            'id': transformed['body']['chat_id'],
-            'model': request.model,
+            'id': 'chatcmpl-' + transformed['body']['chat_id'],
             'object': 'chat.completion.chunk',
-            'system_fingerprint': 'fp_zai_001',
-            'usage': usage,
+            'created': int(time.time()),
+            'model': request.model,
+            'choices': [],
+            'usage': normalized_usage,
         })}\n\n"
 
-    def _build_finish_chunk(self, json_lib, transformed: dict, request: OpenAIRequest) -> str:
+    def _build_finish_chunk(self, json_lib, transformed: dict, request: OpenAIRequest, usage: Optional[Dict] = None, finish_reason: str = 'stop') -> str:
+        """构建结束 chunk（包含 finish_reason 和可选的 usage）"""
+        # 如果有 usage 信息，构建完整的 usage 结构
+        chunk_usage = None
+        if usage:
+            chunk_usage = {
+                'prompt_tokens': usage.get('prompt_tokens', 0),
+                'total_tokens': usage.get('total_tokens', 0),
+                'completion_tokens': usage.get('completion_tokens', 0),
+                'estimated_cost': usage.get('estimated_cost'),
+                'prompt_tokens_details': usage.get('prompt_tokens_details', {
+                    'cached_tokens': 0,
+                    'cache_write_tokens': None,
+                }),
+            }
         return f"data: {json_lib.dumps({
-            'choices': [{
-                'delta': {},
-                'finish_reason': 'stop',
-                'index': 0,
-                'logprobs': None,
-            }],
-            'created': int(time.time()),
-            'id': transformed['body']['chat_id'],
-            'model': request.model,
+            'id': 'chatcmpl-' + transformed['body']['chat_id'],
             'object': 'chat.completion.chunk',
-            'system_fingerprint': 'fp_zai_001',
+            'created': int(time.time()),
+            'model': request.model,
+            'choices': [{
+                'index': 0,
+                'delta': {
+                    'role': 'assistant',
+                    'content': None,
+                    'reasoning_content': None,
+                    'tool_calls': None,
+                },
+                'logprobs': None,
+                'finish_reason': finish_reason,
+            }],
+            'usage': chunk_usage,
         })}\n\n"
 
     def _extract_search_info(self, reasoning_content: str, edit_content: str) -> str:
@@ -1110,24 +1315,32 @@ class ChatCompletionService:
             if re.search(r'(duration=|last_tool_call_name|view=)', first_line) and re.search(r'[">]$', first_line):
                 delta_content = delta_content[first_newline + 1 :]
 
-        # 1. 移除 <details> 开始标签（包括所有属性）
+        # 1. 移除 <glm_block>...</glm_block> 工具调用块（整个块内容不展示给用户）
+        delta_content = re.sub(r'<glm_block[^>]*>.*?</glm_block>', '', delta_content, flags=re.DOTALL)
+        
+        # 2. 移除 <url>...</url> 标签（图片链接已在别处通过 _extract_image_urls 处理）
+        delta_content = re.sub(r'<url>[^<]*</url>', '', delta_content)
+
+        # 3. 移除 <details> 开始标签（包括所有属性）
         delta_content = re.sub(r'<details[^>]*>', '', delta_content)
         
-        # 2. 移除 </details> 结束标签
+        # 4. 移除 </details> 结束标签
         delta_content = re.sub(r'</details>', '', delta_content)
+
         
-        # 3. 移除 <summary> 标签及其内容（如 "Thinking..." 或 "Thought for X seconds"）
+        # 5. 移除 <summary> 标签及其内容（如 "Thinking..." 或 "Thought for X seconds"）
         delta_content = re.sub(r'<summary[^>]*>.*?</summary>', '', delta_content, flags=re.DOTALL)
         
-        # 4. 移除行首的引用标记 "> "（markdown 格式）
+        # 6. 移除行首的引用标记 "> "（markdown 格式）
         delta_content = re.sub(r'^>\s*', '', delta_content, flags=re.MULTILINE)
         delta_content = re.sub(r'\n>\s*', '\n', delta_content)
         
-        # 5. 移除多余的空行（3个及以上连续换行符）
+        # 7. 移除多余的空行（3个及以上连续换行符）
         delta_content = re.sub(r'\n{3,}', '\n\n', delta_content)
         
-        # 6. 去除首尾空白
+        # 8. 去除首尾空白
         return delta_content.strip()
+
 
     def _split_edit_content(self, edit_content: str) -> Tuple[str, str]:
         """拆分 edit_content，返回 (thinking_part, answer_part)
